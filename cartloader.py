@@ -10,6 +10,9 @@ from rich.progress import Progress
 import threading
 from queue import Queue
 import argparse
+from urllib.parse import urljoin
+import logging
+
 
 
 BASE_BBS_URL = "https://www.lexaloffle.com/"
@@ -36,7 +39,9 @@ Developed by @icaroferre
 
 """)
 
-class PICOGAME():
+from urllib.parse import urljoin
+
+class PICOGAME:
     def __init__(self, title, url):
         self.title = title
         self.url = url
@@ -45,57 +50,125 @@ class PICOGAME():
         self.description = ""
         self.developer = ""
         self.thumb_url = ""
-
         self.thumb_file = ""
 
     def getDetails(self):
-        cardUrl = BASE_BBS_URL + "/bbs/" + self.url
+        # Correct URL construction using urljoin
+        cardUrl = urljoin(BASE_BBS_URL, "/bbs/" + self.url)
+        console.print(f"[yellow]Fetching card URL: {cardUrl}[/yellow]")
         cardPage = getPageContent(cardUrl)
-        self.card_url = cardPage.find("a", {"title" : "Open Cartridge File"}).get("href")
-        self.card_name = self.card_url.split("/")[-1]
-        devDiv = cardPage.find("div", {"style" : "font-size:9pt; margin-bottom:4px"})
-        self.developer = devDiv.text.strip()
+        if cardPage is None:
+            logging.error(f"Failed to fetch page content for {self.title}")
+            return
 
-        # Description parser
-        descriptionDiv = cardPage.find("div", {"style" : "min-height:44px;"})
-        self.description = descriptionDiv.text.strip()
-        self.description = self.description.split("Copy and paste the snippet below into your HTML.")[1]
-        self.description = self.description.replace("Note: This cartridge's settings do not allow embedded playback. A [Play at lexaloffle] link will be included instead.", "")
-        self.description = self.description.replace("\t","").replace("\r", "").strip()
-        while "\n\n" in self.description:
-            self.description = self.description.replace("\n\n", "\n")
+        try:
+            # Updated selector: Find 'a' tags with href ending with '.p8.png'
+            a_tags = cardPage.find_all("a", href=True)
+            for a in a_tags:
+                href = a['href']
+                if href.endswith('.p8.png'):
+                    # Use urljoin to handle relative URLs
+                    self.card_url = urljoin(BASE_BBS_URL, href)
+                    self.card_name = os.path.basename(self.card_url)
+                    break
+            if not self.card_url:
+                raise AttributeError("Cartridge file link not found.")
 
-        # Image parser
-        images = cardPage.find_all("img")
-        for i in images:
-            if "thumbs" in i.get("src"):
-                self.thumb_url = i.get("src").strip()
-                self.thumb_file = self.thumb_url.split("/")[-1]
-                break
-        self.download()
+            console.print(f"[green]Cartridge file URL: {self.card_url}[/green]")
+
+            # Extract developer
+            devDiv = cardPage.find("div", {"style": "font-size:9pt; margin-bottom:4px"})
+            self.developer = devDiv.text.strip() if devDiv else "Unknown"
+
+            # Extract description
+            descriptionDiv = cardPage.find("div", {"style": "min-height:44px;"})
+            if descriptionDiv:
+                description_text = descriptionDiv.get_text(separator="\n").strip()
+                split_text = description_text.split("Copy and paste the snippet below into your HTML.")
+                if len(split_text) > 1:
+                    self.description = split_text[1].replace(
+                        "Note: This cartridge's settings do not allow embedded playback. A [Play at lexaloffle] link will be included instead.", ""
+                    ).replace("\t", "").replace("\r", "").strip()
+                    while "\n\n" in self.description:
+                        self.description = self.description.replace("\n\n", "\n")
+                else:
+                    self.description = description_text
+            else:
+                self.description = "No description available."
+
+            # Extract thumbnail URL
+            images = cardPage.find_all("img")
+            self.thumb_url = ""
+            for img in images:
+                src = img.get("src", "")
+                if "thumbs" in src:
+                    self.thumb_url = urljoin(BASE_BBS_URL, src)
+                    self.thumb_file = os.path.basename(self.thumb_url)
+                    break
+
+            if not self.thumb_url:
+                self.thumb_url = ""
+                self.thumb_file = ""
+
+            self.download()
+
+        except AttributeError as e:
+            console.print(f"[red]Failed to find necessary details for {self.title}. Error: {e}[/red]")
+            logging.error(f"Failed to parse details for {self.title}: {e}")
 
     def download(self):
-        console.print("Downloading game: {}".format(self.title))
-        downloadFile(BASE_BBS_URL + self.card_url, self.card_name, "/output/")
-        downloadFile(BASE_BBS_URL + self.thumb_url, self.thumb_file, "/output/media/screenshots/")
+        console.print(f"[cyan]Downloading game: {self.title}[/cyan]")
+        if self.card_url:
+            downloadFile(self.card_url, self.card_name, "output")
+        else:
+            console.print(f"[red]No cartridge URL found for {self.title}[/red]")
+            logging.warning(f"No cartridge URL for {self.title}")
 
+        if self.thumb_url:
+            downloadFile(self.thumb_url, self.thumb_file, os.path.join("output", "media", "screenshots"))
+        else:
+            console.print(f"[yellow]No thumbnail URL found for {self.title}[/yellow]")
+            logging.warning(f"No thumbnail URL for {self.title}")
 
 
 
 def threader():
     while True:
         game = q.get()
+        print(game)
         try:
             game.getDetails()
+            print(game.getDetails())
         except:
             console.print("Failed to download: {}".format(game.title))
         q.task_done()
 
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; YourScriptName/1.0; +https://yourwebsite.com/)"
+}
 def downloadFile(url, filename, path):
-    r = requests.get(url)
-    with open(sys.path[0] + path + filename, 'wb') as outfile:
-        outfile.write(r.content)
+    # Ensure the path does not start with '/' to prevent absolute path issues
+    if path.startswith('/'):
+        path = path[1:]
+    full_path = os.path.join(sys.path[0], path, filename)
+    try:
+        response = requests.get(url, stream=True, headers=HEADERS)
+        response.raise_for_status()  # Raises HTTPError for bad responses
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)  # Ensure directories exist
+        with open(full_path, 'wb') as outfile:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    outfile.write(chunk)
+        console.print(f"[green]Successfully downloaded {filename}[/green]")
+        logging.info(f"Downloaded {filename} from {url}")
+    except requests.exceptions.RequestException as e:
+        console.print(f"[red]Failed to download {filename} from {url}. Error: {e}[/red]")
+        logging.error(f"Failed to download {filename} from {url}: {e}")
+    except Exception as e:
+        console.print(f"[red]Unexpected error while downloading {filename}: {e}[/red]")
+        logging.error(f"Unexpected error for {filename}: {e}")
+
 
 def createFolder(foldername):
     try:
@@ -104,31 +177,33 @@ def createFolder(foldername):
     except FileExistsError:
         pass
 
-def getPageContent(url):
-    params = {}
-    if "#" in url:
-        maybe_params = url.split("#")[1].split("&")
-        for i in maybe_params:
-            keys = i.split("=")
-            params[keys[0]] = keys[1]
-    res = requests.get(url, params=params)
-    content = BeautifulSoup(res.content, "html.parser")
-    return content
+def getPageContent(url, params=None):
+    try:
+        res = requests.get(url, params=params)
+        res.raise_for_status()  # Raises HTTPError for bad responses
+        content = BeautifulSoup(res.content, "html.parser")
+        return content
+    except requests.exceptions.RequestException as e:
+        console.print(f"[red]Error fetching {url}: {e}[/red]")
+        return None
 
-def getGamesFromPage(url):
+
+def getGamesFromPage(url, params):
     with console.status("[bold green]Scraping page for games...") as status:
-        content = getPageContent(url)
+        content = getPageContent(url, params)
+        if content is None:
+            return []
         links = content.find_all("a")
         games_found = []
         for i in links:
-            link_url = str(i.get("href"))
+            link_url = i.get("href", "")
             link_title = i.text.strip()
             if "?tid" in link_url:
                 new_game = PICOGAME(link_title, link_url)
                 games_found.append(new_game)
-                # print(link_title)
-    console.print("Games found: {}".format(len(games_found)))
+    console.print(f"Games found: {len(games_found)}")
     return games_found
+
 
 
 def printGames(games):
@@ -169,17 +244,25 @@ def generateXMLFile(games):
 
 def searchAndDownload():
     games = []
-    for i in range(args.p):      
-        url = "https://www.lexaloffle.com/bbs/?cat=7#sub=2&mode=carts&orderby=featured&page={}".format(i + 1)
-        newgames = getGamesFromPage(url)
+    for i in range(args.p):
+        params = {
+            "cat": 7,
+            "sub": 2,
+            "mode": "carts",
+            "orderby": "featured",
+            "page": i + 1
+        }
+        url = "https://www.lexaloffle.com/bbs/"
+        newgames = getGamesFromPage(url, params)
         for n in newgames:
             games.append(n)
             
-    with console.status("[bold green]Downloading {} games ({} threads)...".format(len(games), args.t)) as status:
+    with console.status(f"[bold green]Downloading {len(games)} games ({args.t} threads)...") as status:
         for i in games:
             q.put(i)
         q.join()
     return games
+
 
 for x in range(args.t):
     t = threading.Thread(target=threader)
@@ -191,4 +274,5 @@ if __name__ == '__main__':
     createInitialFolder()
     games = searchAndDownload()
     generateXMLFile(games)
+
 
